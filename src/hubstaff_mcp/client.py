@@ -1,7 +1,10 @@
 """Hubstaff API client for MCP server."""
 
 import asyncio
+import base64
+import json
 import os
+import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 import httpx
@@ -13,8 +16,14 @@ class HubstaffAPIError(Exception):
 
 
 class HubstaffClient:
-    """Hubstaff API client with OAuth token management."""
-    
+    """Hubstaff API client with OAuth token management.
+
+    Gerencia autenticação OAuth com o Hubstaff, incluindo cache persistente
+    do access token para evitar rate limits no endpoint de refresh.
+    """
+
+    _CACHE_FILE = os.path.expanduser("~/.hubstaff_token_cache.json")
+
     def __init__(self):
         """Initialize the client with refresh token from environment."""
         self.refresh_token = os.getenv("HUBSTAFF_REFRESH_TOKEN")
@@ -23,32 +32,64 @@ class HubstaffClient:
                 "Hubstaff refresh token (personal token) is required. "
                 "Set the HUBSTAFF_REFRESH_TOKEN environment variable."
             )
-        
+
         self.base_url = "https://api.hubstaff.com/v2"
         self.auth_url = "https://account.hubstaff.com/access_tokens"
-        self.access_token = None
+        self.access_token: Optional[str] = self._load_cached_token()
         self.token_expires_at = None
-    
+
+    def _is_token_valid(self, token: str) -> bool:
+        """Verifica se o JWT ainda está dentro do prazo de validade."""
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (4 - len(payload) % 4)
+            decoded = json.loads(base64.urlsafe_b64decode(payload))
+            exp = decoded.get("exp", 0)
+            return time.time() < exp - 60
+        except Exception:
+            return False
+
+    def _load_cached_token(self) -> Optional[str]:
+        """Carrega access token do cache em disco se ainda for válido."""
+        try:
+            if not os.path.exists(self._CACHE_FILE):
+                return None
+            with open(self._CACHE_FILE, "r") as f:
+                cache = json.load(f)
+            token = cache.get("access_token")
+            if token and self._is_token_valid(token):
+                return token
+            return None
+        except Exception:
+            return None
+
+    def _save_cached_token(self, access_token: str) -> None:
+        """Persiste access token no disco para reutilização após reinícios."""
+        try:
+            with open(self._CACHE_FILE, "w") as f:
+                json.dump({"access_token": access_token}, f)
+            os.chmod(self._CACHE_FILE, 0o600)
+        except Exception:
+            pass
+
     async def _refresh_access_token(self) -> str:
         """Refresh the access token using the refresh token."""
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
                 data = {
                     "grant_type": "refresh_token",
                     "refresh_token": self.refresh_token
                 }
-                
+
                 response = await client.post(self.auth_url, data=data)
-                await response.raise_for_status()
+                response.raise_for_status()
 
-                # Get the JSON response
-                token_data = await response.json()
+                token_data = response.json()
+                access_token = token_data["access_token"]
+                self._save_cached_token(access_token)
+                return access_token
 
-                # Extract the access token
-                return token_data["access_token"]
-                
         except Exception as e:
-            # Get error details if it's an HTTP error
             if hasattr(e, 'response'):
                 error_text = f"HTTP {e.response.status_code}: {e.response.text}"
             else:
@@ -78,7 +119,7 @@ class HubstaffClient:
         }
         
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
                 if method.upper() == "GET":
                     response = await client.get(url, headers=headers, params=params)
                 elif method.upper() == "POST":
@@ -130,12 +171,15 @@ class HubstaffClient:
     async def get_users(self, organization_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get organization users."""
         endpoint = "/users"
-        params = {}
+        params: Dict[str, Any] = {}
+
+        # Hubstaff v2 commonly exposes org users through members.
         if organization_id:
-            params["organization_id"] = organization_id
+            endpoint = f"/organizations/{organization_id}/members"
+            params["include_projects"] = "true"
         
         response = await self._make_request("GET", endpoint, params=params)
-        return response.get("users", [])
+        return response.get("members", response.get("users", []))
     
     async def get_organizations(self) -> List[Dict[str, Any]]:
         """Get user organizations."""
@@ -145,9 +189,10 @@ class HubstaffClient:
     async def get_projects(self, organization_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get list of projects."""
         endpoint = "/projects"
-        params = {}
+        params: Dict[str, Any] = {}
         if organization_id:
-            params["organization_id"] = organization_id
+            endpoint = f"/organizations/{organization_id}/projects"
+            params["page_limit"] = 100
         
         response = await self._make_request("GET", endpoint, params=params)
         return response.get("projects", [])
@@ -181,7 +226,7 @@ class HubstaffClient:
         organization_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """Get time entries with optional filtering."""
-        params = {}
+        params: Dict[str, Any] = {}
         
         if start_date:
             params["start_date"] = start_date.strftime("%Y-%m-%d")
@@ -191,11 +236,29 @@ class HubstaffClient:
             params["user_ids"] = ",".join(map(str, user_ids))
         if project_ids:
             params["project_ids"] = ",".join(map(str, project_ids))
+
+        # Hubstaff v2 exposes tracked entries under organization activities.
         if organization_id:
-            params["organization_id"] = organization_id
-        
+            activity_params: Dict[str, Any] = {}
+            if start_date:
+                activity_params["time_slot[start]"] = (
+                    f"{start_date.strftime('%Y-%m-%d')}T00:00:00Z"
+                )
+            if end_date:
+                activity_params["time_slot[stop]"] = (
+                    f"{end_date.strftime('%Y-%m-%d')}T23:59:59Z"
+                )
+            if user_ids:
+                activity_params["user_ids"] = ",".join(map(str, user_ids))
+            response = await self._make_request(
+                "GET",
+                f"/organizations/{organization_id}/activities",
+                params=activity_params
+            )
+            return response.get("activities", [])
+
         response = await self._make_request("GET", "/time_entries", params=params)
-        return response.get("time_entries", [])
+        return response.get("time_entries", response.get("activities", []))
     
     async def create_time_entry(self, time_entry_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new time entry."""
@@ -219,16 +282,23 @@ class HubstaffClient:
         organization_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """Get user activities for a date range."""
-        params = {
-            "start_date": start_date.strftime("%Y-%m-%d"),
-            "end_date": end_date.strftime("%Y-%m-%d")
-        }
+        params: Dict[str, Any] = {}
         
         if user_ids:
             params["user_ids"] = ",".join(map(str, user_ids))
+
         if organization_id:
-            params["organization_id"] = organization_id
-        
+            params["time_slot[start]"] = f"{start_date.strftime('%Y-%m-%d')}T00:00:00Z"
+            params["time_slot[stop]"] = f"{end_date.strftime('%Y-%m-%d')}T23:59:59Z"
+            response = await self._make_request(
+                "GET",
+                f"/organizations/{organization_id}/activities",
+                params=params
+            )
+            return response.get("activities", [])
+
+        params["start_date"] = start_date.strftime("%Y-%m-%d")
+        params["end_date"] = end_date.strftime("%Y-%m-%d")
         response = await self._make_request("GET", "/activities", params=params)
         return response.get("activities", [])
     
@@ -240,16 +310,31 @@ class HubstaffClient:
         organization_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """Get screenshots for a date range."""
-        params = {
-            "start_date": start_date.strftime("%Y-%m-%d"),
-            "end_date": end_date.strftime("%Y-%m-%d")
-        }
+        params: Dict[str, Any] = {}
         
         if user_ids:
             params["user_ids"] = ",".join(map(str, user_ids))
         if organization_id:
-            params["organization_id"] = organization_id
-        
+            params["time_slot[start]"] = f"{start_date.strftime('%Y-%m-%d')}T00:00:00Z"
+            params["time_slot[stop]"] = f"{end_date.strftime('%Y-%m-%d')}T23:59:59Z"
+            try:
+                response = await self._make_request(
+                    "GET",
+                    f"/organizations/{organization_id}/screenshots",
+                    params=params
+                )
+            except HubstaffAPIError as first_error:
+                if "HTTP 404" not in str(first_error):
+                    raise
+                response = await self._make_request(
+                    "GET",
+                    f"/organizations/{organization_id}/activities/screenshots",
+                    params=params
+                )
+            return response.get("screenshots", [])
+
+        params["start_date"] = start_date.strftime("%Y-%m-%d")
+        params["end_date"] = end_date.strftime("%Y-%m-%d")
         response = await self._make_request("GET", "/screenshots", params=params)
         return response.get("screenshots", [])
     
@@ -262,17 +347,23 @@ class HubstaffClient:
         organization_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """Generate timesheets for a date range."""
-        params = {
-            "start_date": start_date.strftime("%Y-%m-%d"),
-            "end_date": end_date.strftime("%Y-%m-%d")
-        }
+        params: Dict[str, Any] = {}
         
         if user_ids:
             params["user_ids"] = ",".join(map(str, user_ids))
         if project_ids:
             params["project_ids"] = ",".join(map(str, project_ids))
         if organization_id:
-            params["organization_id"] = organization_id
-        
+            params["date[start]"] = start_date.strftime("%Y-%m-%d")
+            params["date[stop]"] = end_date.strftime("%Y-%m-%d")
+            response = await self._make_request(
+                "GET",
+                f"/organizations/{organization_id}/timesheets",
+                params=params
+            )
+            return response.get("timesheets", [])
+
+        params["start_date"] = start_date.strftime("%Y-%m-%d")
+        params["end_date"] = end_date.strftime("%Y-%m-%d")
         response = await self._make_request("GET", "/timesheets", params=params)
         return response.get("timesheets", [])
